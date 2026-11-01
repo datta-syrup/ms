@@ -13,7 +13,8 @@
 //! A new voice can be made on the account from a description of how it
 //! sounds ([`Eleven::design`], ElevenLabs's Voice Design): no one's
 //! recording, a voice of its own. The characters of MapleSyrup's story get
-//! theirs that way ([`super::cast`]).
+//! theirs that way ([`super::cast`]), on an account with room for them
+//! ([`Eleven::room_for_a_voice`]).
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -66,6 +67,8 @@ pub struct Design<'a> {
 
 /// ElevenLabs's bounds for what a voice being made says, in characters.
 pub const DESIGN_TEXT: std::ops::RangeInclusive<usize> = 100..=1000;
+/// ElevenLabs's bounds for the description a voice is made from.
+pub const DESIGN_DESCRIPTION: std::ops::RangeInclusive<usize> = 20..=1000;
 /// Making a voice: ElevenLabs makes a few takes of it, spoken.
 const DESIGN_TIMEOUT: Duration = Duration::from_secs(120);
 /// Keeping one of them on the account.
@@ -137,52 +140,38 @@ impl Eleven {
 
     /// A new voice on the account, made from `design`: ElevenLabs makes a
     /// few takes of it and the first is kept, with its name and labels. A
-    /// voice-design model the account can't use gives way to the next;
-    /// labels the account won't take are left off (the voice is made all
-    /// the same).
+    /// voice-design model that won't take the request (one the account
+    /// can't use) gives way to the next.
     pub fn design(&self, design: &Design) -> Result<Voice, AiError> {
         let generated = self.take(design)?;
-        let mut labels = Some(design.labels);
-        loop {
-            let mut body = json!({
-                "voice_name": design.name,
-                "voice_description": design.description,
-                "generated_voice_id": generated,
-            });
-            if let Some(labels) = labels {
-                body["labels"] = json!(labels);
-            }
-            match self.api.post_json("/text-to-voice", &body, SAVE_TIMEOUT) {
-                Ok(made) => {
-                    let id = made["voice_id"]
-                        .as_str()
-                        .filter(|id| !id.is_empty())
-                        .ok_or_else(|| {
-                            AiError::Parse("the new voice came back without an id".into())
-                        })?;
-                    return Ok(Voice {
-                        id: id.to_string(),
-                        name: made["name"]
-                            .as_str()
-                            .unwrap_or(design.name)
-                            .trim()
-                            .to_string(),
-                        about: String::new(),
-                        labels: labels.cloned().unwrap_or_default(),
-                    });
-                }
-                Err(AiError::Http(400 | 422, message))
-                    if labels.is_some() && message.to_lowercase().contains("label") =>
-                {
-                    labels = None;
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        let body = json!({
+            "voice_name": design.name,
+            "voice_description": design.description,
+            "generated_voice_id": generated,
+            "labels": design.labels,
+        });
+        let made = self.api.post_json("/text-to-voice", &body, SAVE_TIMEOUT)?;
+        let id = made["voice_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| AiError::Parse("the new voice came back without an id".into()))?;
+        Ok(Voice {
+            id: id.to_string(),
+            name: made["name"]
+                .as_str()
+                .unwrap_or(design.name)
+                .trim()
+                .to_string(),
+            about: String::new(),
+            labels: design.labels.clone(),
+        })
     }
 
     /// The first take of a voice made from `design` (its generated id),
-    /// from the first voice-design model the account can use.
+    /// from the first voice-design model that takes the request. A model
+    /// that won't (a client error) gives way to the next; anything else —
+    /// the key, the credits, too many requests, the service down — would
+    /// be the same with every model.
     fn take(&self, design: &Design) -> Result<String, AiError> {
         let path = format!("/text-to-voice/design?output_format={DESIGN_FORMAT}");
         let mut last = None;
@@ -198,24 +187,37 @@ impl Eleven {
                         .as_array()
                         .into_iter()
                         .flatten()
-                        .find_map(|take| take["generated_voice_id"].as_str())
-                        .filter(|id| !id.is_empty())
+                        .filter_map(|take| take["generated_voice_id"].as_str())
+                        .find(|id| !id.is_empty())
                         .map(String::from)
                         .ok_or_else(|| {
                             AiError::Parse("ElevenLabs made no take of the voice".into())
                         });
                 }
-                Err(AiError::Http(status @ (400 | 403 | 404 | 422), message))
-                    if message.to_lowercase().contains("model") =>
-                {
-                    last = Some(AiError::Http(status, message));
-                }
+                Err(error @ AiError::Http(400 | 403 | 404 | 422, _)) => last = Some(error),
                 Err(error) => return Err(error),
             }
         }
-        Err(last.unwrap_or_else(|| {
-            AiError::Unsupported("no voice-design model works on this account".into())
-        }))
+        Err(last.unwrap_or_else(|| AiError::Unsupported("no voice-design model to ask".into())))
+    }
+
+    /// Whether the account has room for one more voice of its own: no
+    /// voice is designed, nor its credits spent, on one that has none. An
+    /// account that won't say (a key without that permission, say) is given
+    /// the benefit of the doubt.
+    pub fn room_for_a_voice(&self) -> Result<(), AiError> {
+        let Ok(plan) = self.api.get_json("/user/subscription") else {
+            return Ok(());
+        };
+        match (
+            plan["voice_slots_used"].as_u64(),
+            plan["voice_limit"].as_u64(),
+        ) {
+            (Some(used), Some(limit)) if used >= limit => Err(AiError::Unsupported(format!(
+                "no room for another voice on this ElevenLabs account ({used} of {limit} voices)"
+            ))),
+            _ => Ok(()),
+        }
     }
 
     /// `text` said in voice `voice` (24 kHz mono), delivered as `delivery`

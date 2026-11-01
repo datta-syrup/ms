@@ -1605,85 +1605,93 @@
 
   // The voice: OpenAI's, a character of MapleSyrup's story (its voice is
   // made on the ElevenLabs account the first time it is picked, which the
-  // list shows while it happens), or one of the account's own voices; in a
-  // list with a search when there are many.
-  let voicesKey = "", voiceHeldUntil = 0, voiceChosen = "openai", castChosen = "";
+  // list shows on it while that happens), or one of the account's own
+  // voices; in a list with a search when there are many. The voice in use
+  // is the one marked.
+  let voicesKey = "", voiceHeldUntil = 0, voiceChosen = "openai";
+  // The rows as shown, and the characters whose voices are being made (or
+  // are next).
+  let voiceRows = [], makingNow = new Set();
+  // A character just picked that has no voice yet: shown as being made
+  // until the PC says so (a moment later).
+  let castAsked = "", castAskedUntil = 0;
   // A live call on the phone, unless it was turned off.
   let liveWanted = recall("live") !== "0";
   // A character's name or few words in the page's language, else in the
-  // cast's own fallback language.
-  function inLanguage(byLanguage, fallback) {
+  // cast's own.
+  function inLanguage(byLanguage, language) {
     const choice = LANGUAGES.find((l) => l[0] === locale) || LANGUAGES[0];
-    return (byLanguage && (byLanguage[choice[2]] || byLanguage[fallback])) || "";
+    return (byLanguage && (byLanguage[choice[2]] || byLanguage[language])) || "";
   }
   function renderVoices(list, chosen, cast) {
     list = list || [];
     const characters = (cast && cast.characters) || [];
-    const fallback = (cast && cast.fallback) || "";
-    const making = (cast && cast.making) || "";
+    const language = (cast && cast.language) || "";
+    makingNow = new Set((cast && cast.making) || []);
     // A character's voice shows as the character, not again with the rest.
     const theirs = new Set(characters.map((c) => c.voice).filter(Boolean));
     const own = list.filter((v) => !theirs.has(v.id));
     $("voiceSearch").style.display = characters.length + own.length > 5 ? "" : "none";
-    const ul = $("voiceList");
-    const key = locale + JSON.stringify([list, cast]);
+    const key = locale + JSON.stringify([list, characters]);
     if (key !== voicesKey) {
       voicesKey = key;
+      const ul = $("voiceList");
       ul.textContent = "";
+      voiceRows = [];
       const all = [{ id: "openai", name: t("voice_openai"), about: "" }]
         .concat(characters.map((c) => ({
           id: c.voice || "",
           cast: c.id,
-          name: inLanguage(c.name, fallback),
-          about: c.id === making ? t("voice_making") : inLanguage(c.about, fallback),
+          name: inLanguage(c.name, language),
+          about: inLanguage(c.about, language),
           // Found by its name in the cast's own language too.
-          also: (c.name && c.name[fallback]) || "",
+          also: (c.name && c.name[language]) || "",
         })))
         .concat(own);
       for (const v of all) {
         const li = document.createElement("li");
         li.dataset.id = v.id;
-        if (v.cast) li.dataset.cast = v.cast;
         li.dataset.text = [v.name, v.also, v.about].filter(Boolean).join(" ").toLowerCase();
         const label = document.createElement("span");
         const name = document.createElement("b");
         name.textContent = v.name;
         label.append(name);
-        if (v.about) {
-          const about = document.createElement("span");
-          about.className = "about";
-          about.textContent = v.about;
-          label.append(about);
-        }
+        const about = document.createElement("span");
+        about.className = "about";
+        about.textContent = v.about || "";
+        if (v.about || v.cast) label.append(about);
         const check = document.createElement("span");
         check.className = "check";
         check.textContent = "✓";
         li.append(label, check);
-        li.addEventListener("click", () => (v.cast ? pickCharacter(v.cast, v.id) : pickVoice(v.id)));
+        li.addEventListener("click", () => (v.cast ? pickCharacter(v) : pickVoice(v.id)));
         ul.append(li);
+        voiceRows.push({ v, about });
       }
-      filterVoices();
     }
-    const held = Date.now() <= voiceHeldUntil;
-    // While a character's voice is being made, that character is the one
-    // marked; once it is made (or couldn't be), the voice in use is.
-    if (making) castChosen = making;
-    else if (!held) castChosen = "";
-    if (chosen && !held && chosen !== voiceChosen) voiceChosen = chosen;
-    markVoice();
+    if (chosen && Date.now() > voiceHeldUntil && chosen !== voiceChosen) voiceChosen = chosen;
+    showMaking();
+    filterVoices();
   }
-  function isChosen(li) {
-    return castChosen ? li.dataset.cast === castChosen : li.dataset.id === voiceChosen;
+  // "Making the voice…" on the characters whose voices are being made (or
+  // are next), and on one just picked; their own few words otherwise.
+  function showMaking() {
+    const asked = Date.now() < castAskedUntil ? castAsked : "";
+    for (const row of voiceRows) {
+      if (!row.v.cast) continue;
+      const making = makingNow.has(row.v.cast) || row.v.cast === asked;
+      row.about.textContent = making ? t("voice_making") : row.v.about;
+    }
   }
   function markVoice() {
-    for (const li of $("voiceList").children) li.classList.toggle("sel", isChosen(li));
+    for (const li of $("voiceList").children) li.classList.toggle("sel", li.dataset.id === voiceChosen);
   }
   // The search narrows the list by name or description; the chosen voice
   // always stays in view.
   function filterVoices() {
     const words = $("voiceSearch").value.trim().toLowerCase().split(/\s+/).filter(Boolean);
     for (const li of $("voiceList").children) {
-      const hit = !words.length || words.every((w) => li.dataset.text.includes(w)) || isChosen(li);
+      const hit = !words.length || words.every((w) => li.dataset.text.includes(w)) || li.dataset.id === voiceChosen;
       li.classList.toggle("hidden", !hit);
     }
     markVoice();
@@ -1692,26 +1700,29 @@
   function pickVoice(id) {
     voiceHeldUntil = Date.now() + 2000;
     voiceChosen = id;
-    castChosen = "";
-    markVoice();
+    castAsked = "";
+    showMaking();
+    filterVoices();
     postJson("/api/speaker", { id }).catch(() => {});
     // The voice is for MapleSyrup's own lines and the PC's replies; a live
     // call keeps speaking in its own voice. (Picking a voice used to turn
     // the call off, which silently dropped the player into the browser's
     // speech recognition, in one fixed language.)
   }
-  // A character: in its voice when it has one; else its voice is made
-  // first, and it stays marked while that happens.
-  function pickCharacter(cast, voice) {
-    voiceHeldUntil = Date.now() + 2000;
-    if (voice) {
-      voiceChosen = voice;
-      castChosen = "";
+  // A character: in its voice when it has one (marked at once); else its
+  // voice is made first, which the list shows until the PC switches to it.
+  function pickCharacter(v) {
+    if (v.id) {
+      voiceHeldUntil = Date.now() + 2000;
+      voiceChosen = v.id;
+      castAsked = "";
     } else {
-      castChosen = cast;
+      castAsked = v.cast;
+      castAskedUntil = Date.now() + 3000;
     }
-    markVoice();
-    postJson("/api/speaker", { cast }).catch(() => {});
+    showMaking();
+    filterVoices();
+    postJson("/api/speaker", { cast: v.cast }).catch(() => {});
   }
   // The version, and whether a newer one is on its way (the PC keeps the
   // choice, for good).

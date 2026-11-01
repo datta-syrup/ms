@@ -1073,13 +1073,10 @@ impl Hub {
             // A voice (`id`), or a character of the story (`cast`); the
             // latest pick replaces one not yet taken.
             ("POST", "/api/speaker") => {
-                let valid = |id: &String| crate::ai::cast::valid_id(id);
-                let pick = match (
-                    text_field("id").filter(valid),
-                    text_field("cast").filter(valid),
-                ) {
-                    (Some(id), None) => Some(Inbound::Speaker(id)),
-                    (None, Some(character)) => Some(Inbound::Cast(character)),
+                let plain = |id: &str| crate::util::plain_id(id);
+                let pick = match (text_field("id"), text_field("cast")) {
+                    (Some(id), None) if plain(&id) => Some(Inbound::Speaker(id)),
+                    (None, Some(character)) if plain(&character) => Some(Inbound::Cast(character)),
                     _ => None,
                 };
                 match pick {
@@ -1658,8 +1655,10 @@ mod tests {
         };
         assert_eq!(pick(r#"{"id": "pNInz6obpgDQGcFmaJgB"}"#), 200);
         assert_eq!(pick(r#"{"cast": "nana-ping"}"#), 200);
-        // A character's id is checked like a voice's; one of the two, not both.
+        // A character's id is checked like a voice's; one of the two, not
+        // both (nor a bad one beside a good one).
         assert_eq!(pick(r#"{"cast": "../x"}"#), 400);
+        assert_eq!(pick(r#"{"cast": "syrup", "id": "../x"}"#), 400);
         assert_eq!(
             pick(r#"{"cast": "syrup", "id": "pNInz6obpgDQGcFmaJgB"}"#),
             400
