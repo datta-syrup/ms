@@ -109,6 +109,11 @@ $BuiltIn = @(
 # A question with a long answer, and what is said over it.
 $LongQuestion = "תספר לי בפירוט את כל הסיפור של מייפל איילנד מההתחלה"
 $OverQuestion = "רגע רגע, עצור. כמה MP יש לי?"
+# A sentence with a pause in its middle, as a player thinking aloud: does
+# it jump in during the pause?
+$PauseFirst = "אני חושב שאולי כדאי לי"
+$PauseSecond = "לעבור למפה אחרת, מה אתה אומר?"
+$PauseMs = 900
 
 # ---- a WebSocket with timestamps, and the localhost certificate ---------
 Add-Type -TypeDefinition @"
@@ -477,6 +482,39 @@ try {
     Write-Host ("    heard speech {0} times, answered {1} times, spoke: {2}" -f $NoiseTurn.heard_speech, $NoiseTurn.answered, $NoiseTurn.spoke)
     Start-Sleep -Milliseconds $QuietBetweenMs
 
+    # ---- a pause mid-sentence: does it jump in? -----------------------------
+    Write-Host "[pause] a pause in the middle of a sentence"
+    $firstHalf = Get-Speech $PauseFirst
+    $secondHalf = Get-Speech $PauseSecond
+    [void](Read-Events)
+    $doneBefore = $Socket.Done
+    $firstEnd = $Socket.Stream($firstHalf, $SampleRate, $ChunkMs)
+    $Socket.Quiet($SampleRate, $ChunkMs, $PauseMs, $false, 0)
+    $secondVoice = [BenchClock]::Ms() + $LeadSilenceMs
+    $secondEnd = $Socket.Stream($secondHalf, $SampleRate, $ChunkMs)
+    # Until every answer begun has finished (one cut short, and the one to
+    # the whole sentence).
+    $events = @()
+    $deadline = [BenchClock]::Ms() + $TurnMaxMs
+    do {
+        $Socket.Quiet($SampleRate, $ChunkMs, 300, $false, 0)
+        $more = Read-Events
+        $events = @($events) + @($more)
+        $begun = @($events | Where-Object { $_.Type -eq "response.created" }).Count
+    } while ([BenchClock]::Ms() -lt $deadline -and -not ($begun -gt 0 -and $Socket.Done -ge $doneBefore + $begun))
+    $jumped = $events | Where-Object { $_.Type -eq "response.created" -and $_.At -lt $secondVoice } | Select-Object -First 1
+    $pauseSound = $events | Where-Object { $_.Type -in @("response.output_audio.delta", "response.audio.delta") -and $_.At -ge $secondEnd } | Select-Object -First 1
+    $PauseTurn = [ordered]@{
+        pause_ms = $PauseMs + $LeadSilenceMs
+        jumped_in = [bool]$jumped
+        jumped_after_ms = if ($jumped) { [math]::Round($jumped.At - $firstEnd) } else { $null }
+        first_sound_ms = if ($pauseSound) { [math]::Round($pauseSound.At - $secondEnd) } else { $null }
+        heard = (& $heardOf $events); said = (& $saidOf @($events | Where-Object { $_.At -ge $secondEnd }))
+    }
+    foreach ($e in $events) { [void]$AllEvents.Add([pscustomobject]@{ turn = "pause"; at = [math]::Round($e.At - $firstEnd); type = $e.Type }) }
+    Write-Host ("    jumped in during the pause: {0}; answered {1} ms after the sentence ended" -f $PauseTurn.jumped_in, $PauseTurn.first_sound_ms)
+    Start-Sleep -Milliseconds $QuietBetweenMs
+
     # ---- talking over a long answer: how soon does it notice? --------------
     Write-Host "[over] talking over a long answer"
     $long = Get-Speech $LongQuestion
@@ -515,7 +553,7 @@ try {
     $Report = [ordered]@{
         when = (Get-Date -Format o); label = $Label; model = $Call.model
         session = [ordered]@{ reasoning = $Session.reasoning; turn_detection = $Session.audio.input.turn_detection; noise_reduction = $Session.audio.input.noise_reduction; transcription = $Session.audio.input.transcription; voice = $Session.audio.output.voice; speed = $Session.audio.output.speed }
-        turns = $Turns; noise = $NoiseTurn; talk_over = $OverTurn; events = $AllEvents; error = $Socket.Error
+        turns = $Turns; noise = $NoiseTurn; pause = $PauseTurn; talk_over = $OverTurn; events = $AllEvents; error = $Socket.Error
     }
     $Report | ConvertTo-Json -Depth 12 | Set-Content -Encoding UTF8 (Join-Path $ResultsDir "$Name.json")
     $sounds = @($Turns | Where-Object { $null -ne $_.first_sound_ms } | ForEach-Object { $_.first_sound_ms } | Sort-Object)
@@ -528,6 +566,7 @@ try {
         ("of which hearing the question stop: median {0} ms" -f (& $median $vads)),
         ("answers in the phone's language ({0}): {1} of {2}" -f $Lang, @($Turns | Where-Object { $_.in_language -eq $true }).Count, @($Turns | Where-Object { $null -ne $_.in_language }).Count),
         ("a room with nobody talking ({0} dB, {1} s): heard speech {2} times, answered {3} times, spoke: {4}{5}" -f $NoiseTurn.noise_db, ($NoiseTurn.noise_ms / 1000), $NoiseTurn.heard_speech, $NoiseTurn.answered, $NoiseTurn.spoke, $(if ($NoiseTurn.said) { ": " + $NoiseTurn.said } else { "" })),
+        ("a pause of {0} ms mid-sentence: jumped in: {1}{2}; the whole sentence answered {3} ms after it ended: {4}" -f $PauseTurn.pause_ms, $PauseTurn.jumped_in, $(if ($PauseTurn.jumped_in) { " (" + $PauseTurn.jumped_after_ms + " ms into the pause)" } else { "" }), $PauseTurn.first_sound_ms, $PauseTurn.said),
         ("talking over a long answer ({0}): noticed {1} ms after the player began; the new question answered {2} ms after it ended: {3}" -f $OverTurn.long_answer, $OverTurn.noticed_ms, $OverTurn.next_first_sound_ms, $OverTurn.said_after),
         ""
     )
