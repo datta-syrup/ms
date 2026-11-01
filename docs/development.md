@@ -229,7 +229,11 @@ keeps what the pixels mean in MapleStory, and the orchestration.
     (`ask_language`, `set_tone`), the phone's picker or bar follows, and
     the page hands the call its instructions again — and, for a language,
     the transcription in it (`retune(tone, language)`; `/api/instructions`
-    carries `transcription`). A question that needs working out it
+    carries `transcription`). What was not said to it (noise, a video, the
+    player talking to someone else) it answers with `QUIET_TOOL` and no
+    words; the page answers that tool itself (`liveQuiet`, its name from
+    `/api/live`'s `quiet`) and asks for no turn, and the log says "kept
+    quiet". A question that needs working out it
     announces like a person and hands over through `THINK_TOOL`: the PC
     (`LiveService::think`) posts it to Claude's board as a `question`
     (`Board::ask`) while a Claude Code session listens and waits

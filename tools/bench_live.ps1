@@ -406,7 +406,15 @@ try {
         $calls = @()
         if ($done) { $calls = @($done.Event.response.output | Where-Object { $_.type -eq "function_call" }) }
         $Turn.tools = @()
+        $Turn.kept_quiet = $false
         foreach ($c in $calls) {
+            # Not said to it: it says nothing, and, as on the phone, nothing
+            # more is asked of it.
+            if ($Call.quiet -and $c.name -eq $Call.quiet) {
+                $Socket.Send((@{ type = "conversation.item.create"; item = @{ type = "function_call_output"; call_id = $c.call_id; output = "ok" } } | ConvertTo-Json -Depth 10 -Compress))
+                $Turn.kept_quiet = $true
+                continue
+            }
             $ranFrom = [BenchClock]::Ms()
             $output = if ($ToolsRun -contains $c.name) {
                 try { (Invoke-Link "POST" "/api/tool" @{ name = $c.name; arguments = $c.arguments }).output } catch { "That didn't work." }
@@ -446,6 +454,12 @@ try {
     $Socket.Quiet($SampleRate, $ChunkMs, $AfterNoiseMs, $false, 0)
     $events = Read-Events
     $answered = @($events | Where-Object { $_.Type -eq "response.created" }).Count
+    # (A quiet tool called on the noise is answered as the phone would.)
+    foreach ($d in @($events | Where-Object { $_.Type -eq "response.done" })) {
+        foreach ($c in @($d.Event.response.output | Where-Object { $_.type -eq "function_call" -and $_.name -eq $Call.quiet })) {
+            $Socket.Send((@{ type = "conversation.item.create"; item = @{ type = "function_call_output"; call_id = $c.call_id; output = "ok" } } | ConvertTo-Json -Depth 10 -Compress))
+        }
+    }
     if ($answered -gt 0) {
         # (An answer under way is let finish.)
         $Socket.Silence($SampleRate, $ChunkMs, $doneBefore, $answered, $TurnMaxMs)
@@ -518,7 +532,7 @@ try {
         ""
     )
     foreach ($t in $Turns) {
-        $Summary += ("{0,6} ms  {1}" -f $t.first_sound_ms, $t.question)
+        $Summary += ("{0,6} ms  {1}{2}" -f $t.first_sound_ms, $t.question, $(if ($t.kept_quiet) { "  (kept quiet: took it as not said to it)" } else { "" }))
         $Summary += ("          heard: {0}" -f $t.heard)
         $Summary += ("          said:  {0}" -f $t.said)
         foreach ($tool in $t.tools) {

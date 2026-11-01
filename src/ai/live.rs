@@ -57,6 +57,12 @@ pub const REASONING_EFFORT: &str = "low";
 /// `Thinker`). The call says it will think a moment, and says the answer
 /// when it comes.
 pub const THINK_TOOL: &str = "think_it_through";
+/// The tool the call calls instead of speaking, when what it heard was not
+/// said to it: the player talking to someone else, a video, the game's own
+/// sound, noise. (OpenAI's voice prompting guide: a no-op tool for audio
+/// not addressed to the agent.) The phone answers it without asking the
+/// call to speak.
+pub const QUIET_TOOL: &str = "wait_for_user";
 /// Models in the key's list that are not for a call: writing speech down
 /// and translating it.
 const NOT_FOR_CALLS: &[&str] = &["transcri", "translat", "whisper"];
@@ -77,8 +83,9 @@ set_tone. Either changes their phone's setting too, where they see it. Noise, a 
 video or your own voice coming back never change the language. Say game words the way players say them.
 - Never say again what you said in your last two turns unless they ask again. Never report their level, map or bars \
 unasked; while MapleStory isn't open, talk about whatever they say, and say it isn't open only when they ask about \
-the game. If what you heard makes no sense, or was only noise, say in a few words, in the language you were \
-speaking, that you didn't catch it — never answer it with the game.
+the game. If what you heard was said to you but makes no sense, say in a few words, in the language you were \
+speaking, that you didn't catch it — never answer it with the game. If it wasn't said to you at all (noise, a video, \
+the game's own sound, them talking to someone else), call wait_for_user and say nothing.
 - If they talk over you, stop and go with what they just said; don't repeat what you had said.
 - When they speak you also get a message that is not from them: what your vision engine reads off the game right \
 now — level, HP, MP, EXP (values marked \"about\" are estimates), the map, what moves on the screen, an open \
@@ -316,6 +323,18 @@ pub fn think_tool() -> Value {
     })
 }
 
+/// Saying nothing, as a tool of the call's ([`QUIET_TOOL`]).
+pub fn quiet_tool() -> Value {
+    json!({
+        "type": "function",
+        "name": QUIET_TOOL,
+        "description": "Say nothing and call this when what you heard wasn't said to you: the player talking to \
+    someone else (a friend in the room, their stream, another call), a video, the game's own sound, or noise. Never when \
+    they spoke to you, even unclearly: then say in a few words that you didn't catch it.",
+        "parameters": {"type": "object", "properties": {}},
+    })
+}
+
 /// Makes calls: a short-lived key for the phone to talk to OpenAI with.
 pub struct Live {
     openai: Arc<OpenAi>,
@@ -436,6 +455,7 @@ impl Live {
                         "model": model,
                         "api": "ga",
                         "hint": tuning.words.as_deref().unwrap_or(""),
+                        "quiet": QUIET_TOOL,
                     }));
                 }
                 Err(AiError::Http(400, message))
@@ -507,7 +527,7 @@ impl Live {
             .ok_or_else(|| AiError::Parse("no key in the answer".into()))?;
         let url = self.calls_url.replace("/realtime/calls", "/realtime");
         Ok(
-            json!({"key": key, "url": format!("{url}?model={model}"), "model": model, "api": "beta"}),
+            json!({"key": key, "url": format!("{url}?model={model}"), "model": model, "api": "beta", "quiet": QUIET_TOOL}),
         )
     }
 
@@ -697,6 +717,22 @@ is fine, once"
         assert!(text.contains("Either changes their phone's setting too"));
         let unset = instructions("", &[], None, Spectrum::get().of_voice(Default::default()));
         assert!(unset.contains("speak the language they speak"));
+    }
+
+    #[test]
+    fn what_was_not_said_to_it_gets_no_answer() {
+        let tool = quiet_tool();
+        assert_eq!(tool["name"], QUIET_TOOL);
+        assert_eq!(tools(vec![tool]).len(), 1);
+        let text = instructions(
+            "",
+            &[],
+            Some("he-IL"),
+            Spectrum::get().of_voice(Default::default()),
+        );
+        assert!(text.contains(&format!("call {QUIET_TOOL} and say nothing")));
+        // Said to it but not caught: it says so.
+        assert!(text.contains("said to you but makes no sense"));
     }
 
     #[test]
