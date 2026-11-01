@@ -9,7 +9,13 @@
 //! a chat reply, a long explanation a touch slower and steadier, and each
 //! attitude has its own sound — friendly warmer and steadier, blunt punchy,
 //! savage loud and expressive ([`settings`]).
+//!
+//! A new voice can be made on the account from a description of how it
+//! sounds ([`Eleven::design`], ElevenLabs's Voice Design): no one's
+//! recording, a voice of its own. The characters of MapleSyrup's story get
+//! theirs that way ([`super::cast`]).
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -31,13 +37,41 @@ pub const MODELS: &[&str] = &[
 ];
 
 /// A voice on the player's account.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Voice {
     pub id: String,
     pub name: String,
     /// A few words about it (accent, age, gender, what it's for).
     pub about: String,
+    /// Its labels as the account keeps them (how a character's voice is
+    /// found again); `about` is made of their values.
+    #[serde(skip)]
+    pub labels: BTreeMap<String, String>,
 }
+
+/// A voice to make on the account from a description ([`Eleven::design`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Design<'a> {
+    /// How it sounds.
+    pub description: &'a str,
+    /// What it says while it is made (within [`DESIGN_TEXT`]).
+    pub text: &'a str,
+    /// ElevenLabs's voice-design models, tried in order.
+    pub models: &'a [String],
+    /// Its name on the account.
+    pub name: &'a str,
+    /// Labels it carries on the account.
+    pub labels: &'a BTreeMap<String, String>,
+}
+
+/// ElevenLabs's bounds for what a voice being made says, in characters.
+pub const DESIGN_TEXT: std::ops::RangeInclusive<usize> = 100..=1000;
+/// Making a voice: ElevenLabs makes a few takes of it, spoken.
+const DESIGN_TIMEOUT: Duration = Duration::from_secs(120);
+/// Keeping one of them on the account.
+const SAVE_TIMEOUT: Duration = Duration::from_secs(60);
+/// The takes come back as small recordings: nobody listens to them here.
+const DESIGN_FORMAT: &str = "mp3_22050_32";
 
 pub struct Eleven {
     api: OpenAi,
@@ -71,7 +105,13 @@ impl Eleven {
             .into_iter()
             .flatten()
             .filter_map(|v| {
-                let labels: Vec<String> = v["labels"]
+                let labels: BTreeMap<String, String> = v["labels"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(k, l)| Some((k.clone(), l.as_str()?.trim().to_string())))
+                    .collect();
+                let about: Vec<String> = v["labels"]
                     .as_object()
                     .into_iter()
                     .flatten()
@@ -81,7 +121,8 @@ impl Eleven {
                 Some(Voice {
                     id: v["voice_id"].as_str()?.to_string(),
                     name: v["name"].as_str()?.trim().to_string(),
-                    about: labels.join(", "),
+                    about: about.join(", "),
+                    labels,
                 })
             })
             .collect();
@@ -92,6 +133,89 @@ impl Eleven {
     /// Resting after failing (OpenAI's voice speaks meanwhile).
     pub fn resting(&self) -> bool {
         lock(&self.rest).is_some_and(|until| Instant::now() < until)
+    }
+
+    /// A new voice on the account, made from `design`: ElevenLabs makes a
+    /// few takes of it and the first is kept, with its name and labels. A
+    /// voice-design model the account can't use gives way to the next;
+    /// labels the account won't take are left off (the voice is made all
+    /// the same).
+    pub fn design(&self, design: &Design) -> Result<Voice, AiError> {
+        let generated = self.take(design)?;
+        let mut labels = Some(design.labels);
+        loop {
+            let mut body = json!({
+                "voice_name": design.name,
+                "voice_description": design.description,
+                "generated_voice_id": generated,
+            });
+            if let Some(labels) = labels {
+                body["labels"] = json!(labels);
+            }
+            match self.api.post_json("/text-to-voice", &body, SAVE_TIMEOUT) {
+                Ok(made) => {
+                    let id = made["voice_id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .ok_or_else(|| {
+                            AiError::Parse("the new voice came back without an id".into())
+                        })?;
+                    return Ok(Voice {
+                        id: id.to_string(),
+                        name: made["name"]
+                            .as_str()
+                            .unwrap_or(design.name)
+                            .trim()
+                            .to_string(),
+                        about: String::new(),
+                        labels: labels.cloned().unwrap_or_default(),
+                    });
+                }
+                Err(AiError::Http(400 | 422, message))
+                    if labels.is_some() && message.to_lowercase().contains("label") =>
+                {
+                    labels = None;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// The first take of a voice made from `design` (its generated id),
+    /// from the first voice-design model the account can use.
+    fn take(&self, design: &Design) -> Result<String, AiError> {
+        let path = format!("/text-to-voice/design?output_format={DESIGN_FORMAT}");
+        let mut last = None;
+        for model in design.models {
+            let body = json!({
+                "voice_description": design.description,
+                "model_id": model,
+                "text": design.text,
+            });
+            match self.api.post_json(&path, &body, DESIGN_TIMEOUT) {
+                Ok(answer) => {
+                    return answer["previews"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find_map(|take| take["generated_voice_id"].as_str())
+                        .filter(|id| !id.is_empty())
+                        .map(String::from)
+                        .ok_or_else(|| {
+                            AiError::Parse("ElevenLabs made no take of the voice".into())
+                        });
+                }
+                Err(AiError::Http(status @ (400 | 403 | 404 | 422), message))
+                    if message.to_lowercase().contains("model") =>
+                {
+                    last = Some(AiError::Http(status, message));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            AiError::Unsupported("no voice-design model works on this account".into())
+        }))
     }
 
     /// `text` said in voice `voice` (24 kHz mono), delivered as `delivery`
@@ -329,6 +453,7 @@ mod tests {
             id: name.to_lowercase(),
             name: name.into(),
             about: about.into(),
+            ..Voice::default()
         };
         let voices = [
             voice("Rachel", "american, calm, young, female"),

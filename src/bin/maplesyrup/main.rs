@@ -1650,6 +1650,35 @@ fn set_coaching(
     );
 }
 
+/// Speaks in voice `id` from now on (an ElevenLabs voice's id, or
+/// "openai"): kept for next time, logged, and heard at once — `hello`, said
+/// in it (translated for the player, like its other lines).
+fn use_voice(
+    id: &str,
+    hello: &str,
+    learning: &ai::Learning,
+    out: &mut Outputs,
+    companion: &Companion,
+) {
+    {
+        let mut memory = learning.memory();
+        memory.voice = Some(id.to_string());
+        memory.save();
+    }
+    out.session.line("info", &format!("voice: {id}"));
+    if let Some(worker) = &out.mouth.ai
+        && !companion.muted()
+    {
+        worker.send(Job::Speak {
+            text: hello.to_string(),
+            language: out.language.clone(),
+            kind: Kind::Info,
+            show: false,
+            speak: true,
+        });
+    }
+}
+
 /// The player asked not to be spoken to that way: the attitude goes to
 /// friendly, for good (until they pick another on the phone), and they
 /// are told so in one line. The learner notes the correction too, but the
@@ -3182,13 +3211,27 @@ fn run(options: Options, args: Vec<String>) -> Result<(), String> {
     let eleven_base =
         std::env::var("ELEVENLABS_BASE_URL").unwrap_or_else(|_| ai::eleven::BASE.to_string());
     let voices: Arc<Mutex<Vec<ai::eleven::Voice>>> = Arc::new(Mutex::new(Vec::new()));
+    // Whether the account's voices are listed yet (until then a character's
+    // voice can't be told apart from one still to make).
+    let voices_listed = Arc::new(AtomicBool::new(false));
     // What it found (for the log and the phone).
     let (voices_tx, voices_rx) = mpsc::channel::<String>();
+    // The characters of MapleSyrup's story, offered on the phone with the
+    // account's voices: a character's voice is made on the account the
+    // first time it is picked (one at a time), and found there from then on.
+    let cast = Arc::new(ai::cast::Cast::built_in().unwrap_or_else(|why| {
+        let _ = voices_tx.send(format!("the cast didn't load: {why}"));
+        ai::cast::Cast::default()
+    }));
+    // The character whose voice is being made, and what came of it.
+    let making: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let (made_tx, made_rx) = mpsc::channel::<(String, Result<ai::eleven::Voice, String>)>();
     if let Some(key) = &elevenlabs_key {
-        let (key, base, voices, learning) = (
+        let (key, base, voices, voices_listed, learning) = (
             key.clone(),
             eleven_base.clone(),
             Arc::clone(&voices),
+            Arc::clone(&voices_listed),
             learning.clone(),
         );
         let _ = std::thread::Builder::new()
@@ -3228,6 +3271,7 @@ fn run(options: Options, args: Vec<String>) -> Result<(), String> {
                     list.len()
                 ));
                 *voices.lock().unwrap_or_else(|e| e.into_inner()) = list;
+                voices_listed.store(true, Ordering::Relaxed);
             });
     }
 
@@ -4338,24 +4382,89 @@ fn run(options: Options, args: Vec<String>) -> Result<(), String> {
                                 .iter()
                                 .any(|v| v.id == id);
                         if known {
-                            {
-                                let mut memory = learning.memory();
-                                memory.voice = Some(id.clone());
-                                memory.save();
+                            use_voice(
+                                &id,
+                                "This is my voice now.",
+                                &learning,
+                                &mut out,
+                                &companion,
+                            );
+                        }
+                    }
+                    // A character of the story: its voice on the account,
+                    // or made there now (one at a time; the phone shows it
+                    // being made until it is in the list).
+                    Inbound::Cast(id) => {
+                        let Some(character) = cast.character(&id) else {
+                            out.session
+                                .line("info", &format!("voice: no {id} in the cast"));
+                            continue;
+                        };
+                        let theirs = cast
+                            .voice_of(character, &voices.lock().unwrap_or_else(|e| e.into_inner()))
+                            .map(|v| v.id.clone());
+                        match (theirs, &elevenlabs_key) {
+                            (Some(voice), _) => {
+                                use_voice(
+                                    &voice,
+                                    &character.hello,
+                                    &learning,
+                                    &mut out,
+                                    &companion,
+                                );
                             }
-                            out.session.line("info", &format!("voice: {id}"));
-                            // A word in the new voice.
-                            if let Some(worker) = &out.mouth.ai
-                                && !companion.muted()
-                            {
-                                worker.send(Job::Speak {
-                                    text: "This is my voice now.".into(),
-                                    language: out.language.clone(),
-                                    kind: Kind::Info,
-                                    show: false,
-                                    speak: true,
-                                });
+                            (None, Some(key)) if voices_listed.load(Ordering::Relaxed) => {
+                                let mut slot = making.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Some(busy) = slot.as_deref() {
+                                    // One at a time: the phone keeps showing
+                                    // the one under way.
+                                    out.session.line(
+                                        "info",
+                                        &format!("voice: {id} waits, {busy}'s voice is being made"),
+                                    );
+                                } else {
+                                    *slot = Some(id.clone());
+                                    drop(slot);
+                                    out.session.line(
+                                        "info",
+                                        &format!(
+                                            "ElevenLabs: making {}'s voice",
+                                            cast.name_of(character)
+                                        ),
+                                    );
+                                    let (key, base, cast, made_tx, id) = (
+                                        key.clone(),
+                                        eleven_base.clone(),
+                                        Arc::clone(&cast),
+                                        made_tx.clone(),
+                                        id.clone(),
+                                    );
+                                    let started = std::thread::Builder::new()
+                                        .name("cast".into())
+                                        .spawn(move || {
+                                            let eleven = ai::eleven::Eleven::new(&key, &base);
+                                            let made = match cast.character(&id) {
+                                                Some(character) => cast
+                                                    .make(character, &eleven)
+                                                    .map_err(|e| e.detail()),
+                                                None => Err(format!("no {id} in the cast")),
+                                            };
+                                            let _ = made_tx.send((id, made));
+                                        });
+                                    if let Err(why) = started {
+                                        *making.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                                        out.session.line(
+                                            "info",
+                                            &format!("ElevenLabs: couldn't start making the voice ({why})"),
+                                        );
+                                    }
+                                }
                             }
+                            // No account to make it on, or its voices not
+                            // listed yet (the phone offers no characters then).
+                            (None, _) => out
+                                .session
+                                .line("info", &format!("voice: {id} has no voice yet")),
                         }
                     }
                     Inbound::Attitude(attitude) => {
@@ -4935,6 +5044,36 @@ fn run(options: Options, args: Vec<String>) -> Result<(), String> {
             out.session.line("info", &line);
             out.push(Kind::Info, line);
         }
+        // A character's voice made on the account (it speaks in it at once,
+        // and it joins the list), or why it couldn't be.
+        while let Ok((id, made)) = made_rx.try_recv() {
+            *making.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            let Some(character) = cast.character(&id) else {
+                continue;
+            };
+            let name = cast.name_of(character);
+            match made {
+                Ok(voice) => {
+                    let voice_id = voice.id.clone();
+                    {
+                        let mut list = voices.lock().unwrap_or_else(|e| e.into_inner());
+                        list.retain(|v| v.id != voice_id);
+                        list.push(voice);
+                        list.sort_by_key(|v| v.name.to_lowercase());
+                    }
+                    out.session.line(
+                        "info",
+                        &format!("ElevenLabs: made {name}'s voice ({voice_id})"),
+                    );
+                    use_voice(&voice_id, &character.hello, &learning, &mut out, &companion);
+                }
+                Err(why) => {
+                    let line = format!("ElevenLabs: couldn't make {name}'s voice ({why})");
+                    out.session.line("info", &line);
+                    out.push(Kind::Info, line);
+                }
+            }
+        }
         while let Ok(line) = learned_rx.try_recv() {
             memory_checked = None;
             if line.starts_with("learned from") || line.starts_with("adapted") {
@@ -5031,6 +5170,15 @@ fn run(options: Options, args: Vec<String>) -> Result<(), String> {
                     memory_checked = Some(Instant::now());
                     memory_status = learning.status();
                 }
+                // The story's characters, once the account's voices are
+                // listed (each with its voice there, if it has one yet).
+                let cast_status = (elevenlabs_key.is_some()
+                    && voices_listed.load(Ordering::Relaxed))
+                .then(|| {
+                    let making = making.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let voices = voices.lock().unwrap_or_else(|e| e.into_inner());
+                    cast.status(&voices, making.as_deref())
+                });
                 let obs = companion.last();
                 let mut status = json!({
                     "game": obs.map(|o| o.game.clone()).unwrap_or(GameView::NotFound),
@@ -5064,6 +5212,7 @@ fn run(options: Options, args: Vec<String>) -> Result<(), String> {
                     "attitude": companion.settings.attitude,
                     // The voices to pick from (ElevenLabs), and the one picked.
                     "voices": *voices.lock().unwrap_or_else(|e| e.into_inner()),
+                    "cast": cast_status,
                     "voice": learning.memory().voice.clone().unwrap_or_else(|| "openai".into()),
                     // How long the phone waits after the words stop (it adapts).
                     "settle_ms": learning.memory().adapt.settle_ms,
