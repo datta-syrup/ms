@@ -143,6 +143,11 @@ pub enum Want {
     Verify,
 }
 
+/// Frames in a row of a shape the layout does not fit before the HUD is
+/// looked for on it: one frame of another shape (a resize under way, a
+/// capture lagging one, a switch to fullscreen) would otherwise overwrite
+/// the learned layout, and lose its bars' readings.
+const SHAPE_HOLDS: u32 = 5;
 /// How long the pixels alone get to find the HUD before the model is asked.
 const FIND_FOR: Duration = Duration::from_secs(10);
 /// How often the pixels are asked to find the HUD while they cannot.
@@ -234,6 +239,9 @@ pub struct Sight {
     /// A maximum HP and MP read far from the one known, and how many reads
     /// in a row have said it (see [`Sight::believe`]).
     far_max: [Option<(u64, u32)>; 2],
+    /// A frame size the layout does not fit, and on how many frames in a
+    /// row it has come (see [`SHAPE_HOLDS`]).
+    new_shape: Option<((u32, u32), u32)>,
 }
 
 /// How far, in points, a bar's fill may be from the teacher's last read
@@ -260,9 +268,47 @@ const TOLD_SAID: Duration = Duration::from_secs(600);
 /// A maximum HP or MP outside this share of the one known is a misread —
 /// the classic HUD's thin slash read as a 7 made `594/671` "3947/6771" —
 /// unless the level changed with it, or it holds for [`FAR_MAX_HOLDS`]
-/// reads in a row (the same misread came twice in a row: MP "6395").
+/// reads in a row, those its bar refutes not counting (the same misread
+/// came twice in a row: MP "6395"), or, read by the font, the bar bears it
+/// out ([`font_max_believed`]).
 const MAX_SHARE: (f64, f64) = (0.75, 1.34);
 const FAR_MAX_HOLDS: u32 = 3;
+/// How close, in points, a line the font read must come to its bar's fill
+/// to bear out a maximum far from the one known ([`font_max_believed`]).
+const FONT_MAX_FITS: f32 = 5.0;
+
+/// Whether `max` is near the maximum known (within [`MAX_SHARE`] of it).
+fn near_max(known: u64, max: u64) -> bool {
+    let share = max as f64 / known.max(1) as f64;
+    (MAX_SHARE.0..=MAX_SHARE.1).contains(&share)
+}
+
+/// Whether a maximum HP or MP the font read, `current/max`, is believed
+/// against the one known (`known`): near it, or borne out by the bar — the
+/// line fits the bar's fill within [`FONT_MAX_FITS`] points, and the
+/// maximum known, with the same current, is further from it than
+/// [`numbers::LABEL_TOLERANCE`] (or below the current). The font's glyphs
+/// are matched pixel for pixel, so its current is the line's own, and the
+/// bar is measured apart from the line. A line at 0 bears out no maximum:
+/// every one puts it at 0% (at the deaths of 25 October the classic
+/// `HP[0/114]` read "0/1 14", 1 was taken for the maximum, and the
+/// teacher's right reads after it were "a misread" for minutes). The
+/// teacher's reads are judged by [`Sight::believe`], which does not take a
+/// model's current at its word.
+fn font_max_believed(known: Option<u64>, current: u64, max: u64, bar: Option<f32>) -> bool {
+    let Some(known) = known else {
+        return true;
+    };
+    if near_max(known, max) {
+        return true;
+    }
+    let Some(bar) = bar else {
+        return false;
+    };
+    let percent = |of: u64| current as f32 / of.max(1) as f32 * 100.0;
+    (percent(max) - bar).abs() <= FONT_MAX_FITS
+        && (percent(known) - bar).abs() > numbers::LABEL_TOLERANCE
+}
 
 /// A bar jumping by this much between two frames is a misread (or a
 /// level-up, which the EXP bar does once a session at most): the status
@@ -289,6 +335,20 @@ const LOST_FOR: Duration = Duration::from_secs(20);
 /// the name is more likely wrong than right, and the model would present
 /// it as fact.
 const MAP_FOR: Duration = Duration::from_secs(600);
+
+/// Write `text` to `path` whole or not at all: to a file beside it, then
+/// renamed over it, so a crash or a power cut mid-write (the vision thread
+/// saves while the game runs) never leaves a learned file cut short, which
+/// would be read back as nothing learned.
+pub(crate) fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(".tmp");
+    let temp = PathBuf::from(temp);
+    std::fs::write(&temp, text)?;
+    std::fs::rename(&temp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp);
+    })
+}
 
 fn now_text() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M").to_string()
@@ -453,6 +513,7 @@ impl Sight {
             unread_since: [None; 3],
             observed_at: None,
             far_max: [None; 2],
+            new_shape: None,
         }
     }
 
@@ -465,10 +526,10 @@ impl Sight {
         if let Some(layout) = &self.layout
             && let Ok(t) = serde_json::to_string_pretty(layout)
         {
-            let _ = std::fs::write(self.dir.join("layout.json"), t);
+            let _ = write_atomic(&self.dir.join("layout.json"), &t);
         }
         if let Ok(t) = serde_json::to_string_pretty(&self.facts) {
-            let _ = std::fs::write(self.dir.join("facts.json"), t);
+            let _ = write_atomic(&self.dir.join("facts.json"), &t);
         }
     }
 
@@ -787,8 +848,7 @@ impl Sight {
     /// them, the EXP bar's wrap, and the things the player taught.
     /// Does the sight see the HUD on a screen this shape: a layout that
     /// fits it, whose bars it measured the last time it looked? Then its
-    /// bars and numbers answer for the HUD and the geometry detector can
-    /// rest ([`crate::perceive`]).
+    /// bars and numbers answer for the HUD.
     pub fn sees_hud(&self, width: u32, height: u32) -> bool {
         self.lost_since.is_none()
             && self
@@ -811,7 +871,19 @@ impl Sight {
         let due = self
             .find_tried
             .is_none_or(|t| now.duration_since(t) >= FIND_EVERY);
-        if !fits && due {
+        let size = frame.dimensions();
+        let settled = if fits || self.layout.is_none() {
+            self.new_shape = None;
+            true
+        } else {
+            let n = match self.new_shape {
+                Some((s, n)) if s == size => n.saturating_add(1),
+                _ => 1,
+            };
+            self.new_shape = Some((size, n));
+            n >= SHAPE_HOLDS
+        };
+        if !fits && due && settled {
             self.find_tried = Some(now);
             let _find = tracing::trace_span!("sight.find").entered();
             if self.find_hud(frame).is_err() {
@@ -889,16 +961,8 @@ impl Sight {
                 Field::Mp => seen.mp,
                 Field::Exp => seen.exp,
             };
-            let read = self.numbers.read(frame, field, &band);
-            let percent = read.as_ref().map(|r| r.value.percent());
-            let streak = self.numbers.cross_check(field, percent, bar);
-            disagree = disagree.max(streak);
-            // The game's own number says how far the fill should reach: a
-            // bar whose track end was guessed from its fill is refitted to
-            // it, the way a reading by the teacher refits it. Only a new
-            // bar (under three readings): a well-fitted one that suddenly
-            // disagrees is more likely misread than wrong, and is not bent.
-            // A bar not fitted at all takes the number at once.
+            // A bar not fitted yet (found from the pixels: where its track
+            // ends is not known) has no fill to judge a number by.
             let unfitted = bar.is_none()
                 && self
                     .layout
@@ -909,8 +973,46 @@ impl Sight {
                         Field::Exp => l.exp.as_ref(),
                     })
                     .is_some_and(|b| b.readings.is_empty());
+            // A maximum far from the one known that a fitted bar does not
+            // bear out is not the line's: no reading on this frame (the
+            // teacher reads the line in time, and says whether it holds).
+            // An unfitted bar takes the number as it comes, as it always
+            // has: nothing else can fit it.
+            let read = self.numbers.read(frame, field, &band).filter(|r| {
+                let known = match field {
+                    Field::Hp => self.facts.hp_max,
+                    Field::Mp => self.facts.mp_max,
+                    Field::Exp => return true,
+                };
+                match r.value {
+                    Value::Amount { current, max } => {
+                        unfitted || font_max_believed(known, current, max, bar)
+                    }
+                    Value::Percent(_) => true,
+                }
+            });
+            let percent = read.as_ref().map(|r| r.value.percent());
+            let streak = self.numbers.cross_check(field, percent, bar);
+            disagree = disagree.max(streak);
+            // The number and the bar disagreeing for this long: the font's
+            // examples for the line go (a wrong one is the likelier cause),
+            // and the HUD is read again (below) to label it anew.
+            if streak == numbers::DISAGREE_FOR {
+                self.numbers.forget_field(field);
+            }
+            // The game's own number says how far the fill should reach: a
+            // bar whose track end was guessed from its fill is refitted to
+            // it, the way a reading by the teacher refits it. Only a new
+            // bar (under three readings), and only to a number within
+            // FILL_AGREES of it: a well-fitted one that suddenly disagrees
+            // is more likely misread than wrong, and a number far from a
+            // new one may be the misread — bent to it, the bar scales every
+            // later fill (a track 1.3x too long reads 43% as 34%). A bar
+            // not fitted at all takes the number at once.
+            let near = |p: f32| bar.is_some_and(|b| (p - b).abs() <= FILL_AGREES);
             if (streak > 0 || unfitted)
                 && let Some(p) = percent
+                && (unfitted || near(p))
                 && (unfitted
                     || self
                         .refit_at
@@ -1008,6 +1110,17 @@ impl Sight {
         // from the last read by nature.)
         if seen.hp_number.is_none() {
             seen.hp = self.judge_fill(0, seen.hp, now);
+            // A death the teacher read, its empty bar measuring nothing: that
+            // read still holds, as a read (a fill at zero is no reading, see
+            // `companion::SLIVER`), so the companion sees the death.
+            if seen.hp.is_none()
+                && let Some(t) = self.told[0].filter(|t| {
+                    t.percent <= 0.5 && now.saturating_duration_since(t.at) <= TOLD_JUDGES
+                })
+            {
+                seen.hp = Some(0.0);
+                seen.hp_number = t.amount;
+            }
         }
         if seen.mp_number.is_none() {
             seen.mp = self.judge_fill(1, seen.mp, now);
@@ -1114,8 +1227,10 @@ impl Sight {
     /// or it cannot answer), the fill as it is.
     fn judge_fill(&mut self, i: usize, fill: Option<f32>, now: Instant) -> Option<f32> {
         let fill = fill?;
-        let Some(told) =
-            self.told[i].filter(|t| now.saturating_duration_since(t.at) <= TOLD_JUDGES)
+        // (A read of 0 is a death: the next life starts full, and its fill
+        // is no misread of the 0.)
+        let Some(told) = self.told[i]
+            .filter(|t| now.saturating_duration_since(t.at) <= TOLD_JUDGES && t.percent > 0.5)
         else {
             return Some(fill);
         };
@@ -1129,15 +1244,20 @@ impl Sight {
     /// `v` as believed: an HP or MP whose maximum is far from the one known
     /// (outside [`MAX_SHARE`] of it) is left out, with its text, unless the
     /// level read with it changed or it has held for [`FAR_MAX_HOLDS`]
-    /// reads in a row. A maximum moves at a level-up, a little; the
-    /// classic HUD's thin slash read as a 7 moves it tenfold ("3947/6771"
-    /// for 594/671), and the same misread can come twice in a row. Returns
-    /// the values and a note for each left out.
-    fn believe(&mut self, v: &HudValues) -> (HudValues, Vec<String>) {
+    /// reads. A maximum moves at a level-up, a little; the classic HUD's
+    /// thin slash read as a 7 moves it tenfold ("3947/6771" for 594/671),
+    /// and the same misread can come twice in a row. A read its bar (`bars`:
+    /// HP's and MP's fill, where measured) contradicts, or of a line at 0
+    /// (which puts any maximum at 0%: a dead character's "0/1141"), neither
+    /// holds nor breaks the hold of another: on 25 October the model's
+    /// "150/1141" (13%, the bar 43%) between its right reads of `HP[50/114]`
+    /// began their count again each time, and a maximum misread at a death
+    /// stood for minutes. Returns the values and a note for each left out.
+    fn believe(&mut self, v: &HudValues, bars: [Option<f32>; 2]) -> (HudValues, Vec<String>) {
         let mut v = v.clone();
         let mut notes = Vec::new();
         let level_changed = matches!((self.facts.level, v.level), (Some(a), Some(b)) if a != b);
-        for i in 0..2 {
+        for (i, bar) in bars.into_iter().enumerate() {
             let (amount, known, name) = if i == 0 {
                 (v.hp, self.facts.hp_max, "HP")
             } else {
@@ -1146,23 +1266,32 @@ impl Sight {
             let Some((current, max)) = amount else {
                 continue;
             };
-            let near = known.is_none_or(|k| {
-                let share = max as f64 / k.max(1) as f64;
-                (MAX_SHARE.0..=MAX_SHARE.1).contains(&share)
-            });
-            let held = match self.far_max[i] {
-                Some((m, n)) if m == max => n + 1,
-                _ => 1,
-            };
-            if near || level_changed || held >= FAR_MAX_HOLDS {
+            if level_changed || known.is_none_or(|k| near_max(k, max)) {
                 self.far_max[i] = None;
                 continue;
             }
-            self.far_max[i] = Some((max, held));
-            notes.push(format!(
-                "{name} {current}/{max} not believed: the maximum known is {} (a misread, unless it holds)",
-                known.unwrap_or_default()
-            ));
+            let percent = current as f32 / max.max(1) as f32 * 100.0;
+            let against = bar.filter(|bar| (percent - bar).abs() > numbers::LABEL_TOLERANCE);
+            if against.is_none() && current > 0 {
+                let held = match self.far_max[i] {
+                    Some((m, n)) if m == max => n + 1,
+                    _ => 1,
+                };
+                if held >= FAR_MAX_HOLDS {
+                    self.far_max[i] = None;
+                    continue;
+                }
+                self.far_max[i] = Some((max, held));
+            }
+            let known = known.unwrap_or_default();
+            notes.push(match against {
+                Some(bar) => format!(
+                    "{name} {current}/{max} not believed: it says {percent:.0}% but the bar shows {bar:.0}% (the maximum known is {known})"
+                ),
+                None => format!(
+                    "{name} {current}/{max} not believed: the maximum known is {known} (a misread, unless it holds)"
+                ),
+            });
             if i == 0 {
                 v.hp = None;
                 v.hp_text = None;
@@ -1256,7 +1385,8 @@ disagrees with them is not believed).",
     /// the log, or why nothing could be.
     pub fn calibrated(&mut self, frame: &RgbaImage, c: &Calibration) -> Result<String, String> {
         let at = self.pending_at.take().unwrap_or_else(Instant::now);
-        let (values, disbelieved) = self.believe(&c.values);
+        // (The bars are learned from this very read: none to judge it by.)
+        let (values, disbelieved) = self.believe(&c.values, [None, None]);
         let learn = |b: &Option<NBox>, hue: f32| {
             b.as_ref()
                 .and_then(|b| BarModel::learn(frame, b, Some(hue)))
@@ -1393,10 +1523,11 @@ disagrees with them is not believed).",
             if !self.numbers.wants_sample(field, now) {
                 continue;
             }
-            todo.push((field, text.clone(), bar.band, bar.measure(frame)));
+            let fitted = !bar.readings.is_empty();
+            todo.push((field, text.clone(), bar.band, bar.measure(frame), fitted));
         }
-        for (field, text, band, measured) in todo {
-            let learned = Numbers::believable(field, &text, measured)
+        for (field, text, band, measured, fitted) in todo {
+            let learned = Numbers::believable(field, &text, measured, fitted)
                 .and_then(|_| self.numbers.learn(frame, field, &band, &text, "model", now));
             match learned {
                 Ok(line) => notes.push(line),
@@ -1414,7 +1545,15 @@ disagrees with them is not believed).",
         self.want = None;
         let at = self.pending_at.take().unwrap_or_else(Instant::now);
         let read = v;
-        let (believed, disbelieved) = self.believe(v);
+        // HP's and MP's fill on the frame read, where their bars are fitted.
+        let bars = self.layout.as_ref().map_or([None, None], |l| {
+            [&l.hp, &l.mp].map(|bar| {
+                bar.as_ref()
+                    .filter(|b| !b.readings.is_empty())
+                    .and_then(|b| b.measure(frame))
+            })
+        });
+        let (believed, disbelieved) = self.believe(v, bars);
         let v = &believed;
         let wanted_labels = self.still_unlabelled();
         let mut notes = disbelieved;
@@ -1450,10 +1589,12 @@ disagrees with them is not believed).",
                     }
                     _ => true,
                 };
-                // A reading fixes a new bar's end; a well-learned bar that
-                // suddenly disagrees is more likely misread (or moved) than
-                // wrong, and is not bent to it.
-                if agrees || bar.readings.len() < 3 {
+                // A reading that agrees refines the bar's end; one that
+                // disagrees is not added, to a new bar either — a misread
+                // bent into its fit scales every later fill. Disagreeing
+                // twice, the HUD is looked for again (below), and the
+                // teacher's calibration fits it anew.
+                if agrees {
                     bar.reading(frame, percent);
                 }
             }
@@ -1603,6 +1744,14 @@ cannot read them",
         if self.want.is_none() {
             self.want = Some(Want::Verify);
         }
+    }
+
+    /// The map's name as last read or told, and how long ago that was (the
+    /// intuition decides for itself how old is too old).
+    pub fn place(&self) -> Option<(String, Duration)> {
+        let name = self.facts.map.clone()?;
+        let at = self.map_at?;
+        Some((name, at.elapsed()))
     }
 
     /// Everything the learned sight knows, as lines for the conversation.
@@ -1802,7 +1951,9 @@ mod tests {
         assert_eq!(again.wants(1920, 800), None);
         let blank = RgbaImage::from_pixel(1920, 800, image::Rgba([20, 20, 20, 255]));
         let t0 = Instant::now();
-        again.observe(&blank, t0);
+        for _ in 0..SHAPE_HOLDS {
+            again.observe(&blank, t0);
+        }
         assert!(again.find_failing_since.is_some());
         assert_eq!(again.wants(1920, 800), None);
         again.find_failing_since = Some(t0 - FIND_FOR);
@@ -2748,6 +2899,31 @@ mod tests {
     }
 
     #[test]
+    fn after_a_death_read_the_revived_fill_is_believed() {
+        let dir = temp_dir("revived");
+        let mut sight = Sight::load(&dir);
+        sight
+            .calibrated(&status_bar(60.0, 100.0), &calibration())
+            .unwrap();
+        sight.verified(
+            &status_bar(0.0, 100.0),
+            &HudValues {
+                hp: Some((0, 5000)),
+                mp: Some((2000, 2000)),
+                ..Default::default()
+            },
+        );
+        // The empty bar after the read of 0 is still 0, frame after frame.
+        for _ in 0..3 {
+            let seen = sight.observe(&status_bar(0.0, 100.0), Instant::now());
+            assert_eq!(seen.hp, Some(0.0), "{seen:?}");
+        }
+        let seen = sight.observe(&status_bar(100.0, 100.0), Instant::now());
+        assert!(seen.hp.is_some_and(|hp| hp > 90.0), "{seen:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_read_whose_maximum_is_far_from_the_one_known_is_not_believed_unless_it_holds() {
         let dir = temp_dir("max");
         let mut sight = Sight::load(&dir);
@@ -2816,6 +2992,200 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
+    /// The player's Classic World line of 25 October, `HP[73/114]`, its bar
+    /// boxed by the teacher and its font learned from the session's labels.
+    fn session_of_25_october(name: &str) -> (PathBuf, Sight) {
+        let dir = temp_dir(name);
+        let mut sight = Sight::load(&dir);
+        let (frame, band) = numbers::tests::classic_line("HP[73/114]", 73.0 / 114.0);
+        let c = Calibration {
+            level: None,
+            hp: Some(band.grown(0.05, 0.4)),
+            mp: None,
+            exp: None,
+            minimap: None,
+            values: HudValues {
+                level: Some(5),
+                hp: Some((73, 114)),
+                hp_text: Some("73/114".into()),
+                ..Default::default()
+            },
+        };
+        let line = sight.calibrated(&frame, &c).unwrap();
+        assert!(line.contains("learned"), "{line}");
+        numbers::tests::learn_the_sessions_labels(&mut sight.numbers);
+        (dir, sight)
+    }
+
+    #[test]
+    fn a_death_does_not_leave_a_misread_maximum_that_locks_out_the_readings_after_it() {
+        let (dir, mut sight) = session_of_25_october("death");
+        assert_eq!(sight.facts.hp_max, Some(114));
+        let t0 = Instant::now();
+        let at = |i: u64| t0 + Duration::from_millis(100 * i);
+        // 21:00:59, the character died: HP[0/114] on every frame, the bar
+        // empty. Read as 0 of 114; the maximum stays (it was 0/1 and 1).
+        let (dead, _) = numbers::tests::classic_line("HP[0/114]", 0.0);
+        for i in 0..5 {
+            let seen = sight.observe(&dead, at(i));
+            assert_eq!(seen.hp_number, Some((0, 114)), "{i}: {seen:?}");
+        }
+        assert_eq!(sight.facts.hp_max, Some(114));
+        // Revived, HP[50/114]: read on every frame, not every 25 s.
+        let (alive, _) = numbers::tests::classic_line("HP[50/114]", 50.0 / 114.0);
+        for i in 5..10 {
+            let seen = sight.observe(&alive, at(i));
+            assert_eq!(seen.hp_number, Some((50, 114)), "{i}: {seen:?}");
+        }
+        // The teacher's read of it is believed (21:01:33: "HP 50/114 not
+        // believed: the maximum known is 1").
+        let read = HudValues {
+            level: Some(5),
+            hp: Some((50, 114)),
+            hp_text: Some("HP[50/114]".into()),
+            ..Default::default()
+        };
+        let line = sight.verified(&alive, &read);
+        assert!(!line.contains("not believed"), "{line}");
+        // A maximum misread before (kept in facts.json from a run that
+        // took 0/1 for the line) gives way to the first line the font reads
+        // that the bar bears out, and that the maximum known cannot be.
+        sight.facts.hp_max = Some(1);
+        let seen = sight.observe(&alive, at(10));
+        assert_eq!(seen.hp_number, Some((50, 114)), "{seen:?}");
+        assert_eq!(sight.facts.hp_max, Some(114));
+        // A maximum far from the one known that the bar does not bear out
+        // is no reading (50 of 1140, where the bar shows 44%).
+        let (odd, _) = numbers::tests::classic_line("HP[50/1140]", 50.0 / 114.0);
+        let seen = sight.observe(&odd, at(11));
+        assert_eq!(seen.hp_number, None, "{seen:?}");
+        assert_eq!(sight.facts.hp_max, Some(114));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_misread_maximum_gives_way_to_a_reading_that_holds_whatever_misreads_come_between() {
+        let dir = temp_dir("max-between");
+        let mut sight = Sight::load(&dir);
+        sight
+            .calibrated(&status_bar(60.0, 100.0), &calibration())
+            .unwrap();
+        // The maximum a death left (the line's 0/114 read as 0/1), and the
+        // teacher's reads of 21:12 – 21:13: HP[50/114], right, and the same
+        // line with its brackets read as 1s, 150/1141 (13% where the bar
+        // shows 44%), in turn.
+        sight.facts.hp_max = Some(1);
+        let frame = status_bar(50.0 / 114.0 * 100.0, 100.0);
+        let right = HudValues {
+            hp: Some((50, 114)),
+            ..Default::default()
+        };
+        let wrong = HudValues {
+            hp: Some((150, 1141)),
+            ..Default::default()
+        };
+        let lines: Vec<String> = [&right, &wrong, &right, &wrong, &right]
+            .into_iter()
+            .map(|v| sight.verified(&frame, v))
+            .collect();
+        // The misreads are not believed, and do not stop the right read from
+        // holding: believed the third time it comes (it never was: each
+        // misread between began the count again).
+        for (i, line) in lines.iter().enumerate() {
+            eprintln!("{i}: {line}");
+            assert_eq!(line.contains("not believed"), i < 4, "{i}: {line}");
+        }
+        assert!(lines[1].contains("the bar shows 44%"), "{}", lines[1]);
+        assert_eq!(sight.facts.hp_max, Some(114));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_maximum_the_font_reads_is_believed_near_the_one_known_or_where_the_bar_bears_it_out() {
+        let believed = |known, current, max, bar| font_max_believed(known, current, max, bar);
+        // Nothing known, or near it (a level-up's 114 → 130): believed.
+        assert!(believed(None, 0, 1, Some(0.0)));
+        assert!(believed(Some(114), 115, 130, Some(88.0)));
+        // A line at 0 bears out no maximum (the death of 25 October: 0/1).
+        assert!(!believed(Some(114), 0, 1, Some(0.0)));
+        assert!(!believed(Some(114), 0, 1141, Some(0.0)));
+        // A maximum misread before gives way to a line the bar bears out
+        // and the maximum known cannot be: 50/114 at 44%, 50 of 1 being
+        // nothing; 114/114 full, 114 of 1141 being 10%.
+        assert!(believed(Some(1), 50, 114, Some(43.9)));
+        assert!(believed(Some(1141), 114, 114, Some(100.0)));
+        // A far maximum the bar does not bear out, or with no bar to say:
+        // no.
+        assert!(!believed(Some(114), 50, 1140, Some(43.9)));
+        assert!(!believed(Some(114), 150, 1141, Some(43.9)));
+        assert!(!believed(Some(1), 50, 114, None));
+        // Nor when the bar fits the maximum known as well (both put the line
+        // near the bar's 2%).
+        assert!(!believed(Some(114), 2, 1141, Some(1.0)));
+    }
+
+    #[test]
+    fn a_bar_not_fitted_yet_takes_the_number_the_font_reads_whatever_the_maximum_known() {
+        let dir = temp_dir("unfitted");
+        let mut sight = Sight::load(&dir);
+        let (frame, band) = numbers::tests::classic_line("HP[50/114]", 50.0 / 114.0);
+        // The bar boxed with no number read beside it: where its track
+        // ends is not known, and it has no fill to judge a number by.
+        let c = Calibration {
+            level: None,
+            hp: Some(band.grown(0.05, 0.4)),
+            mp: None,
+            exp: None,
+            minimap: None,
+            values: HudValues::default(),
+        };
+        sight.calibrated(&frame, &c).unwrap();
+        let fitted = |s: &Sight| {
+            !s.layout
+                .as_ref()
+                .unwrap()
+                .hp
+                .as_ref()
+                .unwrap()
+                .readings
+                .is_empty()
+        };
+        assert!(!fitted(&sight));
+        numbers::tests::learn_the_sessions_labels(&mut sight.numbers);
+        // Another character's maximum, kept from before: the font's number
+        // is taken, and fits the bar.
+        sight.facts.hp_max = Some(4785);
+        let seen = sight.observe(&frame, Instant::now());
+        assert_eq!(seen.hp_number, Some((50, 114)), "{seen:?}");
+        assert_eq!(sight.facts.hp_max, Some(114));
+        assert!(fitted(&sight));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_line_at_0_never_makes_a_maximum_however_often_it_is_read() {
+        let dir = temp_dir("max-at-0");
+        let mut sight = Sight::load(&dir);
+        sight
+            .calibrated(&status_bar(60.0, 100.0), &calibration())
+            .unwrap();
+        // Dead, the bar empty, and the model reads `HP[0/114]`'s closing
+        // bracket as a 1 (21:06:35 and 21:06:58: "0/1141"), for as long as
+        // the character lies there.
+        sight.facts.hp_max = Some(114);
+        let dead = status_bar(0.0, 100.0);
+        let misread = HudValues {
+            hp: Some((0, 1141)),
+            ..Default::default()
+        };
+        for i in 0..2 * FAR_MAX_HOLDS {
+            let line = sight.verified(&dead, &misread);
+            assert!(line.contains("not believed"), "{i}: {line}");
+        }
+        assert_eq!(sight.facts.hp_max, Some(114));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn bars_that_disagree_twice_send_it_looking_again() {
         let dir = temp_dir("disagree");
@@ -2831,6 +3201,198 @@ mod tests {
         let line = sight.verified(&frame, &wrong);
         assert!(line.contains("looked for again"), "{line}");
         assert_eq!(sight.wants(1280, 720), Some(Want::Calibrate));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sight that reads the numbers in the font, taught on a HUD of HP
+    /// 400/400, MP 1291/1351 and EXP 37.51% (as in
+    /// `the_numbers_are_read_every_frame_once_the_teacher_spelled_them_out`).
+    fn font_sight(name: &str) -> (Sight, PathBuf) {
+        let dir = temp_dir(name);
+        let mut sight = Sight::load(&dir);
+        let (frame, bands) = numbers::tests::hud((400, 400), (1291, 1351), 37.51);
+        let c = Calibration {
+            level: None,
+            hp: Some(bands[0].grown(0.05, 0.4)),
+            mp: Some(bands[1].grown(0.05, 0.4)),
+            exp: Some(bands[2].grown(0.05, 0.4)),
+            minimap: None,
+            values: HudValues {
+                hp: Some((400, 400)),
+                mp: Some((1291, 1351)),
+                exp_percent: Some(37.51),
+                hp_text: Some("HP [400/400]".into()),
+                mp_text: Some("MP [1291/1351]".into()),
+                exp_text: Some("EXP [37.51%]".into()),
+                ..Default::default()
+            },
+        };
+        sight.calibrated(&frame, &c).unwrap();
+        assert!(sight.numbers.knows(Field::Hp));
+        (sight, dir)
+    }
+
+    /// The HUD of `numbers::tests::hud` with its HP line saying `said` over
+    /// a bar drawn as full as `bar` (a misread, when the two differ).
+    fn hp_line_over(said: (u64, u64), bar: (u64, u64)) -> RgbaImage {
+        let (mut f, b) = numbers::tests::hud(said, (1291, 1351), 37.51);
+        let (drawn, _) = numbers::tests::hud(bar, (1291, 1351), 37.51);
+        let (x, y, w, h) = b[0].pixels(1280, 720);
+        for yy in y..y + h {
+            for xx in x..x + w {
+                f.put_pixel(xx, yy, *drawn.get_pixel(xx, yy));
+            }
+        }
+        f
+    }
+
+    #[test]
+    fn a_label_only_roughly_like_a_fitted_bar_does_not_teach_the_font() {
+        let dir = temp_dir("label-fitted");
+        let mut sight = Sight::load(&dir);
+        let (frame, bands) = numbers::tests::hud((400, 400), (1291, 1351), 37.51);
+        let c = Calibration {
+            level: None,
+            hp: Some(bands[0].grown(0.05, 0.4)),
+            mp: None,
+            exp: None,
+            minimap: None,
+            values: HudValues {
+                hp: Some((400, 400)),
+                ..Default::default()
+            },
+        };
+        sight.calibrated(&frame, &c).unwrap();
+        assert!(!sight.numbers.knows(Field::Hp));
+        // The bar, fitted by that read, shows 100%; a label of 370/400
+        // (92.5%: a 9 read as a 7) is within the 12 points a label of a
+        // bar not yet fitted may be off by, and is not learned from.
+        let label = |text: &str| HudValues {
+            hp_text: Some(text.into()),
+            ..Default::default()
+        };
+        let notes = sight.learn_font(
+            &hp_line_over((370, 400), (400, 400)),
+            &label("HP [370/400]"),
+        );
+        assert!(!sight.numbers.knows(Field::Hp), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("not learned")), "{notes:?}");
+        // One within a few points of it is.
+        let notes = sight.learn_font(
+            &hp_line_over((390, 400), (400, 400)),
+            &label("HP [390/400]"),
+        );
+        assert!(sight.numbers.knows(Field::Hp), "{notes:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_number_that_keeps_disagreeing_with_its_bar_loses_its_examples() {
+        let (mut sight, dir) = font_sight("font-forget");
+        // The font reads 400/400 over a bar 10% full, frame after frame:
+        // the line's examples are dropped (to be learned again), the
+        // other lines' kept.
+        let odd = hp_line_over((400, 400), (40, 400));
+        let t0 = Instant::now();
+        for i in 0..numbers::DISAGREE_FOR {
+            sight.observe(&odd, t0 + Duration::from_millis(100 * i as u64));
+        }
+        let fields: Vec<Field> = sight.numbers.samples().iter().map(|s| s.field).collect();
+        assert!(!fields.contains(&Field::Hp), "{fields:?}");
+        assert!(
+            fields.contains(&Field::Mp) && fields.contains(&Field::Exp),
+            "{fields:?}"
+        );
+        assert!(!sight.numbers.knows(Field::Hp));
+        assert!(sight.numbers.knows(Field::Mp));
+        assert_eq!(sight.wants(1280, 720), Some(Want::Verify));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_bar_is_refitted_only_from_numbers_that_agree_with_it() {
+        let (mut sight, dir) = font_sight("refit");
+        let hp_bar = |sight: &Sight| sight.layout.as_ref().unwrap().hp.clone().unwrap();
+        let before = hp_bar(&sight);
+        assert_eq!(before.readings.len(), 1);
+        // The font reads 400/400 over a bar 10% full (a misread number, or
+        // a bar misread): the young bar is not bent to it.
+        let t0 = Instant::now();
+        sight.observe(&hp_line_over((400, 400), (40, 400)), t0);
+        assert_eq!(hp_bar(&sight), before);
+        // 400/400 over a bar 90% full: within FILL_AGREES, a reading.
+        sight.observe(
+            &hp_line_over((400, 400), (360, 400)),
+            t0 + Duration::from_secs(2),
+        );
+        assert_eq!(hp_bar(&sight).readings.len(), 2);
+        // The teacher's read far from a young bar does not bend it either.
+        let dir2 = temp_dir("refit-verified");
+        let mut sight = Sight::load(&dir2);
+        let frame = status_bar(60.0, 100.0);
+        sight.calibrated(&frame, &calibration()).unwrap();
+        let before = hp_bar(&sight);
+        let line = sight.verified(
+            &frame,
+            &HudValues {
+                hp: Some((1000, 5000)),
+                ..Default::default()
+            },
+        );
+        assert!(line.contains("bar said"), "{line}");
+        assert_eq!(hp_bar(&sight), before);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn one_frame_of_another_shape_does_not_replace_the_layout() {
+        let dir = temp_dir("shape");
+        let mut sight = Sight::load(&dir);
+        sight
+            .calibrated(&status_bar(60.0, 100.0), &calibration())
+            .unwrap();
+        let kept = sight.layout.clone().unwrap();
+        assert!(!kept.hp.as_ref().unwrap().readings.is_empty());
+        // The same HUD on a wider frame (a resize under way, a frame that
+        // lags it): once, it is no new screen.
+        let wide = image::imageops::resize(
+            &status_bar(60.0, 100.0),
+            1280,
+            600,
+            image::imageops::FilterType::Nearest,
+        );
+        let t0 = Instant::now();
+        sight.observe(&wide, t0);
+        assert_eq!(sight.layout.as_ref(), Some(&kept));
+        assert_eq!(Sight::load(&dir).layout.as_ref(), Some(&kept));
+        // Back to the shape it knows, then the new shape for good: looked
+        // for once it has held.
+        sight.observe(&status_bar(60.0, 100.0), t0 + Duration::from_millis(100));
+        for n in 0..SHAPE_HOLDS {
+            assert_eq!(sight.layout.as_ref().unwrap().frame, (1280, 720), "{n}");
+            sight.observe(&wide, t0 + Duration::from_millis(200 + 100 * n as u64));
+        }
+        assert_eq!(sight.layout.as_ref().unwrap().frame, (1280, 600));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn learned_files_are_written_whole_through_a_file_beside_them() {
+        let dir = temp_dir("atomic");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("facts.json");
+        std::fs::write(&path, "an older, longer version of the file").unwrap();
+        write_atomic(&path, "{}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(left.len(), 1, "{left:?}");
+        // The sight saves through it.
+        let mut sight = Sight::load(&dir);
+        sight.facts.level = Some(61);
+        sight.save();
+        assert_eq!(Sight::load(&dir).facts.level, Some(61));
+        assert!(!dir.join("facts.json.tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

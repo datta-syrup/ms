@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use super::memory::Learning;
 use super::openai::{Delivery, Turn};
 use super::style::{self, Attitude};
+use crate::companion::spectrum::{Level, Spectrum};
 use crate::companion::{Deck, GameView, Gauge, Kind, Observation, Progress, SoFar};
 
 /// Turns of conversation kept (a turn is one sentence each way).
@@ -311,7 +312,8 @@ announce a level-up or mention their level unless asked.
 - Don't say again what you said in your last two replies unless they ask again. Never report their level, map or \
 bars unasked; while MapleStory isn't open, talk about whatever they say, and say it isn't open only when they ask \
 about the game. If what you heard makes no sense, say in a few words you didn't catch it; don't guess.
-- If your last reply ends with \"…\", they talked over you there: don't repeat it; go with what they said now.
+- If your last reply ends with \"…\", they talked over you: don't repeat it; answer what they said ([silent] \
+if only to stop you).
 - Trust your eyes: use what you see when it matters (values marked \"about\" are estimates); if the screen clearly \
 shows something other than what they say, say what you see; never ask them to read it to you — look closer.
 - When they correct you, take it in a word and keep it (note_correction); what they corrected you on before beats what you think you know.
@@ -359,6 +361,15 @@ fn attitude_of(learning: Option<&Learning>, fallback: Attitude) -> Attitude {
     learning.map(|l| l.memory().attitude).unwrap_or(fallback)
 }
 
+/// The level of the bar it talks at ([`super::memory::Memory::level`]), or
+/// `fallback`'s own level when nothing keeps it.
+fn level_of(learning: Option<&Learning>, fallback: Attitude) -> &'static Level {
+    match learning {
+        Some(learning) => learning.memory().level(),
+        None => Spectrum::get().of_voice(fallback),
+    }
+}
+
 /// The ElevenLabs voice the player picked, if they did.
 fn voice_of(learning: Option<&Learning>) -> Option<String> {
     learning
@@ -388,6 +399,14 @@ pub struct Brain {
     /// The language he asked to be answered in ("talk to me in English"),
     /// until he asks for another.
     asked_language: Option<&'static str>,
+    /// The game's values as they are now, which the slots of its lines
+    /// (`{hp}`…) are filled with when they are said (None: no slots, as in
+    /// the tests).
+    pub fresh: Option<std::sync::Arc<crate::companion::fresh::Fresh>>,
+    /// The standing plan the intuition's mind keeps (what to suggest when
+    /// asked what to do), as a paragraph for the instructions; None when
+    /// there is none yet ([`Brain::set_plan`]).
+    plan: Option<String>,
 }
 
 /// Who the player is, for the rules: his name as his own file says it (or
@@ -520,7 +539,36 @@ impl Brain {
             here_en: Deck::seeded(session_seed()),
             here_he: Deck::seeded(session_seed()),
             asked_language: None,
+            fresh: None,
+            plan: None,
         }
+    }
+
+    /// The standing plan changed: `text` is the paragraph for the
+    /// instructions (None: no plan).
+    pub fn set_plan(&mut self, text: Option<String>) {
+        self.plan = text.filter(|t| !t.trim().is_empty());
+    }
+
+    /// The standing plan's paragraph, when there is one.
+    pub fn plan(&self) -> Option<&str> {
+        self.plan.as_deref()
+    }
+
+    /// `text` with its slots (`{hp}`…) filled with the game's values as
+    /// they are now (unchanged without [`Brain::fresh`]).
+    pub fn fill(&self, text: &str) -> String {
+        match &self.fresh {
+            Some(fresh) => fresh.fill(text).text,
+            None => text.to_string(),
+        }
+    }
+
+    /// What the model is told about the slots, when there are any.
+    pub fn slots_guide(&self) -> Option<String> {
+        self.fresh
+            .as_ref()
+            .map(|_| crate::companion::fresh::guide())
     }
 
     /// The next "same as before" line, in its attitude: a card of the deck
@@ -647,11 +695,7 @@ impl Brain {
     /// Who it is: the part of the instructions that stays the same from one
     /// reply to the next (so OpenAI keeps it cached, and answers sooner).
     pub fn persona(&self) -> String {
-        let mut text = format!(
-            "{PERSONA}\n\n{}\n\n{MORE}\n{}",
-            style::rules(self.attitude()),
-            who_he_is(self.player_name().as_deref())
-        );
+        let mut text = persona_text(self.level(), self.player_name().as_deref());
         if self.learning.is_none() && !self.about_player.trim().is_empty() {
             text.push_str("\n\nAbout the player (they told you this):\n");
             text.push_str(self.about_player.trim());
@@ -664,12 +708,38 @@ impl Brain {
     /// text can't spell it (the owner's Michael came out as Armani, Miha,
     /// Mako, Miguel and Mikael, and each was learned and used).
     pub fn player_name(&self) -> Option<String> {
-        match &self.learning {
-            Some(learning) => learning.player_name(),
-            None => super::memory::name_in(&self.about_player),
-        }
+        player_name_of(self.learning.as_ref(), &self.about_player)
     }
+}
 
+/// The player's name as [`Brain::player_name`] has it, for code without a
+/// brain.
+fn player_name_of(learning: Option<&Learning>, about_player: &str) -> Option<String> {
+    match learning {
+        Some(learning) => learning.player_name(),
+        None => super::memory::name_in(about_player),
+    }
+}
+
+/// Who MapleSyrup is: the persona, the bar's rules at `level`, the rest,
+/// and who the player is — the one text [`Brain::persona`] and
+/// [`persona_for`] both start from, so the two lanes never drift apart.
+fn persona_text(level: &Level, player_name: Option<&str>) -> String {
+    format!(
+        "{PERSONA}\n\n{}\n\n{MORE}\n{}",
+        style::rules(level),
+        who_he_is(player_name)
+    )
+}
+
+/// Who MapleSyrup is, as [`Brain::persona`] has it, for a lane that has no
+/// brain of its own (the intuition's mind thinks in the background): the
+/// persona at the bar's level, with the player's name from his own file.
+pub fn persona_for(learning: &Learning) -> String {
+    persona_text(learning.memory().level(), learning.player_name().as_deref())
+}
+
+impl Brain {
     /// The language he asked to be answered in, kept until he asks for
     /// another ([`asked_language`]); else `None`.
     pub fn asked_language(&self) -> Option<&'static str> {
@@ -697,6 +767,12 @@ impl Brain {
     /// How it talks now (the player picks it on the phone).
     pub fn attitude(&self) -> Attitude {
         attitude_of(self.learning.as_ref(), self.attitude)
+    }
+
+    /// The level of the bar it talks at now (the player sets the bar on the
+    /// phone).
+    pub fn level(&self) -> &'static Level {
+        level_of(self.learning.as_ref(), self.attitude)
     }
 
     /// The ElevenLabs voice the player picked, if they did.
@@ -827,9 +903,11 @@ fn presence(so_far: &SoFar) -> Option<String> {
 
 /// What the companion sees, as a few plain lines for the model, and what
 /// a friend in the room would know of the session so far (`so_far`).
-/// `in_front`: whether the game is the window in front — behind another
-/// window it is still read, but the picture is withheld, and the model is
-/// told so rather than told the game is in view and given no picture.
+/// `in_front`: whether the game is in view (in front, or behind another
+/// window while the capture gets it as it is drawn) — behind another window
+/// on a capture that copies the screen it is still read, but the picture is
+/// withheld, and the model is told so rather than told the game is in view
+/// and given no picture.
 pub fn snapshot_with_view(
     obs: Option<&Observation>,
     in_front: bool,
@@ -4658,8 +4736,8 @@ clearly talking to someone else (stream chat, a friend, a call), reply with exac
         ("Sure thing, boss.", "Sure thing, boss."),
         ("Of course, genius. Pot.", "Of course, genius. Pot."),
         (
-            "Good question, dumbass. It's Henesys.",
-            "Good question, dumbass. It's Henesys.",
+            "Good question, rookie. It's Henesys.",
+            "Good question, rookie. It's Henesys.",
         ),
         ("Of course, you idiot.", "Of course, you idiot."),
         ("Certainly, captain obvious.", "Certainly, captain obvious."),
